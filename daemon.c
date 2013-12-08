@@ -5,6 +5,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <fcntl.h>
@@ -31,7 +32,7 @@ typedef enum RUN_STATUS {
 typedef struct Daemon {
     pid_t pid, parent_pid, sid;
     mode_t file_mask;
-    const char *identify_name, *run_as_user, *run_directory, *lock_file;
+    const char *identify_name, *run_user, *run_directory, *lock_file, *pid_file;
     Options *options;
 } Daemon;
 
@@ -39,7 +40,7 @@ static int run_status = RUN_STATUS_NORMAL;
 
 static void child_handler(int signal)
 {
-    switch(signal) {
+    switch (signal) {
         case SIGTERM:
         case SIGUSR1:
             run_status = RUN_STATUS_EXIT_SUCCESS;
@@ -73,11 +74,6 @@ static void exit_graceful(EXIT_STATUS exit_status)
     exit(exit_status);
 }
 
-static pid_t get_parent_pid(void)
-{
-    return getppid();
-}
-
 static int create_lock_file(const char *lock_file)
 {
     int lock_file_descriptor = -1;
@@ -87,7 +83,14 @@ static int create_lock_file(const char *lock_file)
         lock_file_descriptor = open(lock_file, O_RDWR | O_CREAT, 0640);
 
         if (lock_file_descriptor < 0) {
-            syslog(LOG_ERR, "unable to create lock file %s, code=%d (%s)",
+            syslog(LOG_ERR, "failed to create lock file %s, code=%d (%s)",
+                   lock_file, errno, strerror(errno));
+
+            return 0;
+        }
+
+        if (flock(lock_file_descriptor, LOCK_EX | LOCK_NB) == -1) {
+            syslog(LOG_ERR, "failed to lock file %s, code=%d (%s)",
                    lock_file, errno, strerror(errno));
 
             return 0;
@@ -97,6 +100,37 @@ static int create_lock_file(const char *lock_file)
     }
 
     return 0;
+}
+
+static int create_pid_file(const char *pid_file)
+{
+    FILE *file_handle;
+
+    if ((file_handle = fopen (pid_file, "w")) == NULL) {
+        syslog(LOG_ERR, "failed to create pid file %s, code=%d (%s)",
+               pid_file, errno, strerror(errno));
+
+        return 0;
+    }
+
+    pid_t pid = getpid();
+
+    fprintf(file_handle, "%i\n", (int) pid);
+    fclose(file_handle);
+
+    return 1;
+}
+
+static int remove_file(const char *file)
+{
+    if ((unlink(file)) == -1) {
+        syslog(LOG_ERR, "failed to remove file %s, code=%d (%s)",
+               file, errno, strerror(errno));
+
+        return 0;
+    }
+
+    return 1;
 }
 
 static int set_file_mask(mode_t file_mask)
@@ -131,7 +165,7 @@ static int set_run_directory(const char *run_directory)
     /* Change the current working directory.  This prevents the current
        directory from being locked; hence not being able to remove it. */
     if ((chdir(run_directory)) < 0) {
-        syslog(LOG_ERR, "unable to change directory to %s, code %d (%s)",
+        syslog(LOG_ERR, "failed to change directory to %s, code %d (%s)",
                    run_directory, errno, strerror(errno));
 
         return 0;
@@ -144,21 +178,21 @@ static int redirect_io(void)
 {
     /* Redirect standard files to /dev/null */
     if (freopen("/dev/null", "r", stdin) == NULL) {
-        syslog(LOG_ERR, "unable to redirect stdin, code %d (%s)",
+        syslog(LOG_ERR, "failed to redirect stdin, code %d (%s)",
                errno, strerror(errno));
 
         return 0;
     }
 
     if (freopen("/dev/null", "w", stdout) == NULL) {
-        syslog(LOG_ERR, "unable to redirect stdout, code %d (%s)",
+        syslog(LOG_ERR, "failed to redirect stdout, code %d (%s)",
                errno, strerror(errno));
 
         return 0;
     }
 
     if (freopen("/dev/null", "w", stderr) == NULL) {
-        syslog(LOG_ERR, "unable to redirect stderr, code %d (%s)",
+        syslog(LOG_ERR, "failed to redirect stderr, code %d (%s)",
                errno, strerror(errno));
 
         return 0;
@@ -173,7 +207,7 @@ static int start_new_session(pid_t *sid)
     *sid = setsid();
 
     if (*sid < 0) {
-        syslog(LOG_ERR, "unable to create a new session, code %d (%s)",
+        syslog(LOG_ERR, "failed to create a new session, code %d (%s)",
                    errno, strerror(errno));
 
         return 0;
@@ -182,19 +216,19 @@ static int start_new_session(pid_t *sid)
     return 1;
 }
 
-static int fork_active_process(pid_t *pid, pid_t *parent_pid)
+static int fork_active_process(pid_t *parent_pid)
 {
-    *pid = fork();
+    pid_t pid = fork();
 
-    if (*pid < 0) {
-        syslog(LOG_ERR, "unable to fork daemon, code=%d (%s)",
+    if (pid < 0) {
+        syslog(LOG_ERR, "failed to fork daemon, code=%d (%s)",
                errno, strerror(errno));
 
         return 0;
     }
 
     /* If we got a good PID, then we can exit the parent process. */
-    if (*pid > 0) {
+    if (pid > 0) {
         /* Wait for confirmation from the child via SIGTERM or SIGCHLD, or
            for two seconds to elapse (SIGALRM). pause() should not return. */
         alarm(2);
@@ -203,7 +237,7 @@ static int fork_active_process(pid_t *pid, pid_t *parent_pid)
         exit_graceful(EXIT_STATUS_FAILURE);
     }
 
-    *parent_pid = get_parent_pid();
+    *parent_pid = getppid();
 
     return 1;
 }
@@ -211,7 +245,7 @@ static int fork_active_process(pid_t *pid, pid_t *parent_pid)
 static int close_parent_process(pid_t parent_pid)
 {
     if (kill(parent_pid, SIGUSR1) < 0) {
-        syslog(LOG_ERR, "unable to close parent process, code=%d (%s)",
+        syslog(LOG_ERR, "failed to close parent process, code=%d (%s)",
                errno, strerror(errno));
 
         return 0;
@@ -286,16 +320,26 @@ static int set_ignored_signals(void)
     return 1;
 }
 
+static void cleanup(Daemon *daemon)
+{
+    remove_file(daemon->pid_file);
+    remove_file(daemon->lock_file);
+
+    Daemon_destroy(daemon);
+}
+
 static void update(Daemon *daemon)
 {
     switch (run_status) {
-        case RUN_STATUS_EXIT_SUCCESS:
-            Daemon_destroy(daemon);
+        case RUN_STATUS_EXIT_SUCCESS: {
+            cleanup(daemon);
             exit_graceful(EXIT_STATUS_SUCCESS);
+        }
 
-        case RUN_STATUS_EXIT_FAILURE:
-            Daemon_destroy(daemon);
+        case RUN_STATUS_EXIT_FAILURE: {
+            cleanup(daemon);
             exit_graceful(EXIT_STATUS_FAILURE);
+        }
 
         default:
             break;
@@ -317,18 +361,20 @@ static void sleep_ms(unsigned int milliseconds)
 }
 
 static Daemon *init(const char *identify_name,
-                    const char *run_as_user,
+                    const char *run_user,
                     const char *run_directory,
                     const char *lock_file,
+                    const char *pid_file,
                     pid_t pid, pid_t parent_pid, pid_t sid,
                     mode_t file_mask)
 {
     Daemon *daemon = malloc(sizeof(Daemon));
 
     daemon->identify_name = identify_name;
-    daemon->run_as_user = run_as_user;
+    daemon->run_user = run_user;
     daemon->run_directory = run_directory;
     daemon->lock_file = lock_file;
+    daemon->pid_file = pid_file;
 
     daemon->pid = pid;
     daemon->parent_pid = parent_pid;
@@ -362,13 +408,14 @@ void Daemon_destroy(Daemon *daemon)
 }
 
 Daemon *Daemon_create(const char *identify_name,
-                      const char *run_as_user,
+                      const char *run_user,
                       const char *run_directory,
-                      const char *lock_file)
+                      const char *lock_file,
+                      const char *pid_file)
 {
     // return if we're already daemonized
-    if (get_parent_pid() == 1) {
-        syslog(LOG_INFO, "already daemonized");
+    if (getppid() == 1) {
+        syslog(LOG_INFO, "instance is already daemonized");
 
         return NULL;
     }
@@ -376,21 +423,24 @@ Daemon *Daemon_create(const char *identify_name,
     init_log(identify_name);
     syslog(LOG_INFO, "started");
 
-    pid_t pid, parent_pid, sid;
+    pid_t parent_pid, sid;
     mode_t file_mask = 0;
 
     if (create_lock_file(lock_file)
-        && set_run_user(run_as_user)
+        && set_run_user(run_user)
         && set_trapped_signals()
-        && fork_active_process(&pid, &parent_pid)
+        && fork_active_process(&parent_pid)
         && set_ignored_signals()
         && set_file_mask(file_mask)
         && start_new_session(&sid)
+        && create_pid_file(pid_file)
         && set_run_directory(run_directory)
         && redirect_io()
         && close_parent_process(parent_pid)
     ) {
-        return init(identify_name, run_as_user, run_directory, lock_file,
+        pid_t pid = getpid();
+
+        return init(identify_name, run_user, run_directory, lock_file, pid_file,
                     pid, parent_pid, sid,
                     file_mask);
     }

@@ -8,7 +8,7 @@ typedef enum RUN_STATUS RUN_STATUS;
 
 typedef struct Daemon Daemon;
 
-extern Daemon *Daemon_create(const char *, const char *, const char *, const char *);
+extern Daemon *Daemon_create(const char *, const char *, const char *, const char *, const char *);
 extern void Daemon_destroy(Daemon *);
 
 extern void Daemon_init_options(Daemon *, int, char **);
