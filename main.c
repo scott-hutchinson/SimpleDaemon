@@ -6,8 +6,8 @@ int main(int argc, char **argv)
     Daemon *daemon = Daemon_create("mydaemon",
                                    "root",
                                    "/",
-                                   "/var/lock/subsys/mydaemon",
-                                   "/var/run/mydaemon.pid");
+                                   "/var/lock",
+                                   "/var/run");
 
     if (daemon) {
         Daemon_init_options(daemon, argc, argv);

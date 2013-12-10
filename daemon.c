@@ -32,7 +32,8 @@ typedef enum RUN_STATUS {
 typedef struct Daemon {
     pid_t pid, parent_pid, sid;
     mode_t file_mask;
-    const char *identify_name, *run_user, *run_directory, *lock_file, *pid_file;
+    const char *identify_name, *run_user, *run_directory;
+    char *lock_file, *pid_file;
     Options *options;
 } Daemon;
 
@@ -74,8 +75,32 @@ static void exit_graceful(EXIT_STATUS exit_status)
     exit(exit_status);
 }
 
-static int create_lock_file(const char *lock_file)
+static char *build_file_name(const char *pattern,
+                             const char *file_basepath,
+                             const char *identify_name)
 {
+    char *file_name = malloc((size_t) snprintf(NULL, 0, pattern, file_basepath, identify_name) + 1);
+    sprintf(file_name, pattern, file_basepath, identify_name);
+
+    return file_name;
+}
+
+static int cleanup_file_name(char *file_name)
+{
+    if (file_name != NULL) {
+        free(file_name);
+        file_name = NULL;
+
+        return 1;
+    }
+
+    return 0;
+}
+
+static int create_lock_file(const char *lock_file_basepath, const char *identify_name)
+{
+    char *lock_file = build_file_name("%s/%s", lock_file_basepath, identify_name);
+
     int lock_file_descriptor = -1;
 
     // Create the lock file as the current user
@@ -85,31 +110,36 @@ static int create_lock_file(const char *lock_file)
         if (lock_file_descriptor < 0) {
             syslog(LOG_ERR, "failed to create lock file %s, code=%d (%s)",
                    lock_file, errno, strerror(errno));
-
+            cleanup_file_name(lock_file);
             return 0;
         }
 
         if (flock(lock_file_descriptor, LOCK_EX | LOCK_NB) == -1) {
             syslog(LOG_ERR, "failed to lock file %s, code=%d (%s)",
                    lock_file, errno, strerror(errno));
-
+            cleanup_file_name(lock_file);
             return 0;
         }
 
+        cleanup_file_name(lock_file);
         return 1;
     }
 
+    syslog(LOG_ERR, "failed to lock file %s, unknown error", lock_file);
+    cleanup_file_name(lock_file);
     return 0;
 }
 
-static int create_pid_file(const char *pid_file)
+static int create_pid_file(const char *pid_file_basepath, const char *identify_name)
 {
+    char *pid_file = build_file_name("%s/%s.pid", pid_file_basepath, identify_name);
+
     FILE *file_handle;
 
-    if ((file_handle = fopen (pid_file, "w")) == NULL) {
+    if ((file_handle = fopen(pid_file, "w")) == NULL) {
         syslog(LOG_ERR, "failed to create pid file %s, code=%d (%s)",
                pid_file, errno, strerror(errno));
-
+        cleanup_file_name(pid_file);
         return 0;
     }
 
@@ -118,6 +148,7 @@ static int create_pid_file(const char *pid_file)
     fprintf(file_handle, "%i\n", (int) pid);
     fclose(file_handle);
 
+    cleanup_file_name(pid_file);
     return 1;
 }
 
@@ -325,6 +356,9 @@ static void cleanup(Daemon *daemon)
     remove_file(daemon->pid_file);
     remove_file(daemon->lock_file);
 
+    cleanup_file_name(daemon->lock_file);
+    cleanup_file_name(daemon->pid_file);
+
     Daemon_destroy(daemon);
 }
 
@@ -363,8 +397,8 @@ static void sleep_ms(unsigned int milliseconds)
 static Daemon *init(const char *identify_name,
                     const char *run_user,
                     const char *run_directory,
-                    const char *lock_file,
-                    const char *pid_file,
+                    const char *lock_file_basepath,
+                    const char *pid_file_basepath,
                     pid_t pid, pid_t parent_pid, pid_t sid,
                     mode_t file_mask)
 {
@@ -373,8 +407,9 @@ static Daemon *init(const char *identify_name,
     daemon->identify_name = identify_name;
     daemon->run_user = run_user;
     daemon->run_directory = run_directory;
-    daemon->lock_file = lock_file;
-    daemon->pid_file = pid_file;
+
+    daemon->lock_file = build_file_name("%s/%s", lock_file_basepath, identify_name);
+    daemon->pid_file = build_file_name("%s/%s.pid", pid_file_basepath, identify_name);
 
     daemon->pid = pid;
     daemon->parent_pid = parent_pid;
@@ -410,8 +445,8 @@ void Daemon_destroy(Daemon *daemon)
 Daemon *Daemon_create(const char *identify_name,
                       const char *run_user,
                       const char *run_directory,
-                      const char *lock_file,
-                      const char *pid_file)
+                      const char *lock_file_basepath,
+                      const char *pid_file_basepath)
 {
     // return if we're already daemonized
     if (getppid() == 1) {
@@ -426,21 +461,22 @@ Daemon *Daemon_create(const char *identify_name,
     pid_t parent_pid, sid;
     mode_t file_mask = 0;
 
-    if (create_lock_file(lock_file)
+    if (create_lock_file(lock_file_basepath, identify_name)
         && set_run_user(run_user)
         && set_trapped_signals()
         && fork_active_process(&parent_pid)
         && set_ignored_signals()
         && set_file_mask(file_mask)
         && start_new_session(&sid)
-        && create_pid_file(pid_file)
+        && create_pid_file(pid_file_basepath, identify_name)
         && set_run_directory(run_directory)
         && redirect_io()
         && close_parent_process(parent_pid)
     ) {
         pid_t pid = getpid();
 
-        return init(identify_name, run_user, run_directory, lock_file, pid_file,
+        return init(identify_name, run_user, run_directory,
+                    lock_file_basepath, pid_file_basepath,
                     pid, parent_pid, sid,
                     file_mask);
     }
